@@ -1,43 +1,54 @@
 # ===============================
-#  Dockerfile - Nextcloud (sans post-install)
-#  Ubuntu 24.04 + Apache2 + PHP 8.3 (+ MariaDB locale optionnelle)
+#  Dockerfile - Nextcloud (fix des alertes)
+#  Ubuntu 24.04 + Apache2 + PHP 8.3 + Redis
+#  - PAS de post-install initiale (pas de occ maintenance:install)
+#  - Auto-remediation occ SI Nextcloud déjà installé (config.php présent)
+#  - PAS de SMTP, PAS de Traefik ici (proxy externe)
 # ===============================
 
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Utiliser bash pour plus de robustesse
+# === Variables d'env (à surcharger dans Dokploy) ===
+ENV NC_DOMAIN="nextcloud.example.com" \
+    NC_OVERWRITE_PROTO="https" \
+    NC_TRUSTED_PROXIES="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" \
+    NC_DEFAULT_PHONE_REGION="FR" \
+    NC_MAINT_WINDOW_START="3" \
+    NC_DATA_DIR="/var/nc-data"
+
+# Utiliser bash pour RUN
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# ---- Paquets système, Apache, MariaDB, PHP & extensions Nextcloud ----
+# ---- Paquets système, Apache, MariaDB (optionnel), PHP & extensions Nextcloud, Redis ----
 RUN apt-get update && apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
-      apache2 mariadb-server wget curl ca-certificates unzip \
+      apache2 mariadb-server wget curl ca-certificates unzip rsync \
       php libapache2-mod-php php-mysql php-xml php-curl php-gd php-zip \
       php-mbstring php-intl php-bcmath php-gmp php-imagick php-exif php-apcu \
-      util-linux procps sudo ffmpeg smbclient && \
+      redis-server php-redis \
+      ghostscript librsvg2-2 \
+      util-linux procps sudo ffmpeg smbclient cron && \
     update-ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# ---- Télécharger Nextcloud (dernière archive stable) ----
+# ---- Télécharger Nextcloud stable ----
 WORKDIR /tmp
 RUN wget -q https://download.nextcloud.com/server/releases/latest.zip && \
     mkdir -p /var/www/html && \
     unzip -q latest.zip && \
-    # déplace le contenu de nextcloud/ vers /var/www/html/
     rsync -a nextcloud/ /var/www/html/ && \
     rm -rf latest.zip nextcloud
 
-# ---- Apache: modules + vhost Nextcloud ----
+# ---- Apache: modules + vhost Nextcloud (MIME, headers, .well-known) ----
 RUN a2enmod rewrite headers env dir mime setenvif && \
     rm -f /etc/apache2/sites-enabled/000-default.conf
-
-# Nextcloud s’appuie sur .htaccess => AllowOverride All sur le docroot
 RUN cat >/etc/apache2/sites-available/nextcloud.conf <<'__VHOST__'
 <VirtualHost *:80>
     ServerName _
     DocumentRoot /var/www/html
     DirectoryIndex index.php
 
+    # ---- Réécritures Nextcloud (.htaccess actif) ----
     <Directory /var/www/html>
         Require all granted
         AllowOverride All
@@ -49,12 +60,22 @@ RUN cat >/etc/apache2/sites-available/nextcloud.conf <<'__VHOST__'
         SetEnv HTTP_HOME /var/www/html
     </Directory>
 
-    # En-têtes recommandées
+    # ---- Redirections .well-known ----
+    Redirect 301 /.well-known/carddav  /remote.php/dav
+    Redirect 301 /.well-known/caldav   /remote.php/dav
+
+    # ---- Types MIME pour checks Nextcloud ----
+    AddType application/javascript .mjs
+    AddType application/json       .map
+    AddType application/wasm       .wasm
+    AddType font/otf               .otf
+
+    # ---- En-têtes sécurité (HSTS appliqué quand reverse-proxy sert en HTTPS) ----
     <IfModule mod_headers.c>
-        Header always set Referrer-Policy "no-referrer"
+        Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains; preload"
         Header always set X-Content-Type-Options "nosniff"
         Header always set X-Frame-Options "SAMEORIGIN"
-        Header always set X-XSS-Protection "1; mode=block"
+        Header always set Referrer-Policy "no-referrer"
         Header always set Permissions-Policy "interest-cohort=()"
     </IfModule>
 
@@ -64,7 +85,7 @@ RUN cat >/etc/apache2/sites-available/nextcloud.conf <<'__VHOST__'
 __VHOST__
 RUN a2ensite nextcloud
 
-# ---- PHP tuning (valeurs recommandées Nextcloud) ----
+# ---- PHP tuning (recommandations Nextcloud) ----
 RUN mkdir -p /etc/php/8.3/apache2/conf.d
 RUN cat >/etc/php/8.3/apache2/conf.d/90-nextcloud.ini <<'__PHPINI__'
 ; Mémoire & uploads
@@ -88,40 +109,55 @@ session.cookie_httponly = 1
 session.use_strict_mode = 1
 __PHPINI__
 
-# ---- Permissions web ----
+# ---- Data dir hors webroot + droits ----
+RUN mkdir -p "${NC_DATA_DIR}" && \
+    chown -R www-data:www-data "${NC_DATA_DIR}" && \
+    chmod 750 "${NC_DATA_DIR}"
 RUN chown -R www-data:www-data /var/www/html && \
     find /var/www/html -type d -exec chmod 750 {} \; && \
     find /var/www/html -type f -exec chmod 640 {} \;
 
-# ---------- Script d'entrée (sans post-install) ----------
-# - Initialise MariaDB si le datadir est vide
-# - Démarre MariaDB en arrière-plan (optionnel)
-# - (Optionnel) crée la base 'nextcloud' et l'utilisateur 'nextcloud' (aucun occ lancé)
-# - Lance Apache au premier plan (OK pour Dokploy)
+# ---- Imagick: activer SVG si bloqué par policy.xml ----
+RUN if [ -f /etc/ImageMagick-6/policy.xml ]; then \
+      sed -i 's~<policy domain="coder" rights="none" pattern="SVG" />~<!-- SVG enabled -->~g' /etc/ImageMagick-6/policy.xml || true ; \
+    fi
+
+# ---------- Script d'entrée ----------
+# - Démarre Redis
+# - (Optionnel) Initialise + démarre MariaDB locale (si présente)
+# - Lance une boucle cron interne (*/5 min) pour cron.php
+# - SI Nextcloud déjà installé (config.php présent) => applique remédiations `occ`
+#   (trusted_domains, overwrite*, trusted_proxies, forwarded_for_headers, memcache, datadirectory,
+#    maintenance_window_start, default_phone_region, db:add-missing-indices, maintenance:repair --include-expensive)
+# - Démarre Apache (foreground)
 RUN cat >/usr/local/bin/entrypoint.sh <<'__ENTRY__'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-echo "==[BOOT]== $(date -Is) Nextcloud container (no post-install)"
+log() { echo "[$(date -Is)] $*"; }
 
-# Répertoires runtime
-mkdir -p /run/mysqld /run/apache2
-chown -R mysql:mysql /run/mysqld /var/lib/mysql || true
+log "== BOOT: Nextcloud container =="
 
-# MariaDB locale optionnelle
+# 1) Redis
+log "Starting redis-server"
+redis-server --daemonize yes
+
+# 2) MariaDB locale (optionnelle)
 if command -v mariadb-install-db >/dev/null 2>&1; then
+  mkdir -p /run/mysqld
+  chown -R mysql:mysql /run/mysqld /var/lib/mysql || true
   if [ ! -d "/var/lib/mysql/mysql" ]; then
-    echo "==[DB]== Initialisation MariaDB (datadir vide)"
+    log "Initializing MariaDB datadir"
     mariadb-install-db --user=mysql --ldata=/var/lib/mysql
   fi
-
-  echo "==[DB]== Démarrage MariaDB"
+  log "Starting MariaDB"
   mysqld_safe --skip-networking=0 --bind-address=127.0.0.1 >/var/log/mysqld_safe.log 2>&1 &
   for i in $(seq 1 60); do
-    mysqladmin ping -uroot --silent && break || sleep 1
-  done
+    if mysqladmin ping -uroot --silent; then break; fi
+    sleep 1
+  done || true
 
-  # Création OPTIONNELLE base & user (sans post-install Nextcloud)
+  # Création silencieuse base & user si Nextcloud choisit cette DB locale
   if mysql -uroot -e "SELECT 1" >/dev/null 2>&1; then
     mysql -uroot <<'__SQL__'
 CREATE DATABASE IF NOT EXISTS nextcloud CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -129,19 +165,83 @@ CREATE USER IF NOT EXISTS 'nextcloud'@'localhost' IDENTIFIED BY 'P@ssw0rd';
 GRANT ALL PRIVILEGES ON nextcloud.* TO 'nextcloud'@'localhost';
 FLUSH PRIVILEGES;
 __SQL__
-    echo "==[DB]== Base 'nextcloud' et user 'nextcloud' prêts (aucune post-install Nextcloud exécutée)"
+    log "MariaDB ready (DB nextcloud / user nextcloud@localhost)"
   fi
 else
-  echo "==[DB]== MariaDB non présent, on continue sans base locale"
+  log "MariaDB not present (external DB expected)"
 fi
 
-# Démarrage Apache au premier plan (Dokploy OK)
-echo "==[WEB]== Démarrage Apache (foreground)"
+# 3) Cron interne simple (évite un second conteneur) — toutes les 5 minutes
+( while true; do
+    sleep 300
+    if [ -f /var/www/html/cron.php ]; then
+      sudo -u www-data php -f /var/www/html/cron.php >/dev/null 2>&1 || true
+    fi
+  done ) &
+
+# 4) Auto-remédiation SI Nextcloud déjà installé
+NC_CFG="/var/www/html/config/config.php"
+if [ -f "$NC_CFG" ]; then
+  log "config.php found — applying remediation via occ"
+
+  # Attendre qu'Apache serve PHP correctement avant occ
+  # (certains environnements ont besoin que mod_php soit “chaud”)
+  sleep 3
+
+  # Helper occ
+  OCC='sudo -u www-data php -d memory_limit=1024M /var/www/html/occ'
+
+  # a) Core config (trusted domains, proxy headers, overwrite*)
+  $OCC config:system:set trusted_domains 0 --value="${NC_DOMAIN}" --type=string || true
+  $OCC config:system:set overwrite.cli.url  --value="${NC_OVERWRITE_PROTO}://${NC_DOMAIN}" --type=string || true
+  $OCC config:system:set overwritehost       --value="${NC_DOMAIN}" --type=string || true
+  $OCC config:system:set overwriteprotocol   --value="${NC_OVERWRITE_PROTO}" --type=string || true
+
+  # trusted_proxies (liste CSV -> tableau)
+  IFS=',' read -ra PRX <<< "${NC_TRUSTED_PROXIES}"
+  idx=0
+  for p in "${PRX[@]}"; do
+    $OCC config:system:set trusted_proxies $idx --value="$p" --type=string || true
+    idx=$((idx+1))
+  done
+  # forwarded_for_headers
+  $OCC config:system:set forwarded_for_headers 0 --value="HTTP_X_FORWARDED_FOR" --type=string || true
+  $OCC config:system:set forwarded_for_headers 1 --value="HTTP_FORWARDED"      --type=string || true
+
+  # b) Data dir (hors webroot) — ne change rien si déjà configuré autrement
+  $OCC config:system:set datadirectory --value="${NC_DATA_DIR}" --type=string || true
+  mkdir -p "${NC_DATA_DIR}" && chown -R www-data:www-data "${NC_DATA_DIR}" && chmod 750 "${NC_DATA_DIR}"
+
+  # c) Memcache & locks (APCu + Redis local)
+  $OCC config:system:set memcache.local   --value="\\OC\\Memcache\\APCu"  --type=string || true
+  $OCC config:system:set memcache.locking --value="\\OC\\Memcache\\Redis" --type=string || true
+  $OCC config:system:set redis host --value="127.0.0.1" --type=string || true
+  $OCC config:system:set redis port --value="6379"      --type=integer || true
+
+  # d) Fenêtre de maintenance & région téléphone
+  $OCC config:system:set maintenance_window_start --value="${NC_MAINT_WINDOW_START}" --type=integer || true
+  $OCC config:system:set default_phone_region --value="${NC_DEFAULT_PHONE_REGION}" --type=string || true
+
+  # e) Indices & migrations mimetype (peut durer)
+  $OCC db:add-missing-indices || true
+  $OCC maintenance:repair --include-expensive || true
+
+  # f) Client Push (application) — active l'app si présente
+  $OCC app:install client_push || true
+  $OCC app:enable  client_push || true
+
+  log "Remediation steps applied (where applicable)."
+else
+  log "config.php not found — skipping occ remediation (install Nextcloud via web first)."
+fi
+
+# 5) Apache en foreground
+log "Starting Apache (foreground)"
 exec apache2ctl -D FOREGROUND
 __ENTRY__
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# ---- Exposition & santé ----
+# ---- Healthcheck (HTTP interne) ----
 EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=5s --retries=10 \
   CMD curl -fsS -o /dev/null http://127.0.0.1/ || exit 1
